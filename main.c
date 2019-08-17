@@ -34,23 +34,21 @@
 #include <rte_ethdev.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
+#include <rte_ip.h>
+#include <rte_ether.h>
+#include <rte_byteorder.h>
+#include "rte_rwlock.h"
+
 
 static struct rte_eth_conf port_conf = {
 	.rxmode = {
-		.mq_mode = ETH_MQ_RX_RSS,
-		.max_rx_pkt_len = ETHER_MAX_LEN,
 		.split_hdr_size = 0,
-	},
-	.rx_adv_conf = {
-		.rss_conf = {
-			.rss_key = NULL,
-			.rss_hf = ETH_RSS_IP,
-		},
 	},
 	.txmode = {
 		.mq_mode = ETH_MQ_TX_NONE,
 	},
 };
+
 static uint16_t nb_rxd = 1024;
 static uint16_t nb_txd = 1024;
 #define MAX_RX_QUEUE_PER_LCORE 16
@@ -62,24 +60,30 @@ struct lcore_queue_conf {
 	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
 } __rte_cache_aligned;
 struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
-
+static int nb_flows;
+#define MAX_NAME_LENGTH 100
+#define MAX_IP_NUMBER_PER_FLOW 10
+#define MAX_FLOW_NUMBER 10
+struct flow_info {
+	char name[MAX_NAME_LENGTH];
+	unsigned int nb_ip;
+	uint32_t ip[MAX_IP_NUMBER_PER_FLOW];
+	unsigned long bytes;
+};
+struct flow_info flow_infos[MAX_FLOW_NUMBER];
 static volatile bool force_quit;
 struct rte_mempool* pktmbuf_pool = NULL;
 // static struct ether_addr ethernet_port[RTE_MAX_ETHPORTS];
 static unsigned long enabled_port_mask;
-static char* file_name;
+static char* file_name = NULL;
 static unsigned int rx_queue_per_lcore = 1;
-static const char short_options[] = "p:t:";
-static const struct option long_options[] = {
-	{"file", required_argument, NULL, 0},
-	{NULL, 0, 0, 0}
-};
-
+static rte_rwlock_t rwl[MAX_FLOW_NUMBER];
+static uint64_t timer_period = 1; /* default period is 1 seconds */
 static void
 signal_handler(int signal_number) {
 	if (signal_number == SIGINT || signal_number == SIGTERM) {
-		printf("\nSignal %d is received. Preparing to exit.\n");
-		force_quit == true;
+		printf("\nSignal %d is received. Preparing to exit.\n",signal_number);
+		force_quit = true;
 	}
 }
 
@@ -104,9 +108,15 @@ parse_args(int argc, char** argv) {
 	int ret, opt;
 	int option_index;
 	char** argvopt = argv;
+	char* prgname = argv[0];
+	const char short_options[] = "p:t:";
+	const struct option long_options[] = {
+		{"file", required_argument, NULL, 1},
+		{NULL, 0, 0, 0}
+	};
 
 	while ((opt = getopt_long(argc, argvopt, short_options, 
-		long_options, &option_index) != -1)){
+		long_options, &option_index)) != -1){
 		switch (opt) {
 		case 'p':
 			enabled_port_mask = parse_portmask_args(optarg);
@@ -115,14 +125,16 @@ parse_args(int argc, char** argv) {
 				return -1;
 			}
 			break;
+		case 1:
+			file_name = malloc(strlen(optarg));
+			strcpy(file_name, optarg);
+			break;
 		case 0:
-			file_name = optarg;
 			break;
 		default:
 			return -1;
 		}
 	}
-
 	ret = optind - 1;
 	return ret;
 }
@@ -185,10 +197,68 @@ check_all_ports_link_status(uint32_t port_mask) {
 	}
 }
 
+static inline size_t
+get_vlan_offset(struct ether_hdr* eth_hdr, uint16_t* proto)
+{
+	size_t vlan_offset = 0;
+	if (rte_cpu_to_be_16(ETHER_TYPE_VLAN) == *proto) {
+		struct vlan_hdr* vlan_hdr = (struct vlan_hdr*)(eth_hdr + 1);
+		vlan_offset = sizeof(struct vlan_hdr);
+		*proto = vlan_hdr->eth_proto;
+		if (rte_cpu_to_be_16(ETHER_TYPE_VLAN) == *proto) {
+			vlan_hdr = vlan_hdr + 1;
+			*proto = vlan_hdr->eth_proto;
+			vlan_offset += sizeof(struct vlan_hdr);
+		}
+	}
+	return vlan_offset;
+}
+
 /* accelerate the bytes */
 static void
 do_work(struct rte_mbuf* m) {
-	printf("abc\n");
+	struct ether_hdr* eth_hdr;
+	struct ipv4_hdr* ipv4_hdr;
+	uint16_t ether_type, offset;
+	int i, j;
+
+	eth_hdr = rte_pktmbuf_mtod(m,struct ether_hdr*);
+	ether_type = eth_hdr->ether_type;
+	if (ether_type == rte_cpu_to_be_16(ETHER_TYPE_VLAN))
+		printf("VLAN taged frame, offset:");
+	offset = get_vlan_offset(eth_hdr, &ether_type);
+	if (offset > 0)
+		printf("%d\n", offset);
+	if (ether_type == rte_cpu_to_be_16(ETHER_TYPE_ARP)) {
+		/* handle arp */
+	}else if (eth_hdr->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)) {
+		ipv4_hdr = (struct ipv4_hdr*)((char*)(eth_hdr + 1)+offset);
+		printf("ip = %d\n", ipv4_hdr->dst_addr);
+		for (i = 0; i < MAX_FLOW_NUMBER; i++) {
+			for (j = 0; j < flow_infos[i].nb_ip; j++) {
+				if (ipv4_hdr->dst_addr == flow_infos[i].ip[j]) {
+					rte_rwlock_write_lock(&rwl[i]);
+					flow_infos[i].bytes += m->data_len;
+					rte_rwlock_write_unlock(&rwl[i]);
+					printf("%ld\n", flow_infos[i].bytes);
+					break;
+				}
+			}
+		}
+	}
+}
+
+/* display the rates of all flows */
+static void 
+display_statistics() {
+	int i;
+	for (i = 0; i < nb_flows; i++) {
+		rte_rwlock_write_lock(&rwl[i]);
+		printf("flow_name:%s\trate:%ld\n", flow_infos[i].name, flow_infos[i].bytes);
+		flow_infos[i].bytes = 0;
+		rte_rwlock_write_unlock(&rwl[i]);
+	}
+	printf("\n\n");
 }
 static int 
 main_loop(__attribute__((unused)) void* dummy) {
@@ -201,42 +271,71 @@ main_loop(__attribute__((unused)) void* dummy) {
 
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_queue_conf[lcore_id];
-	if (qconf->n_rx_port == 0) {
-		printf("lcore %u has nothing to do\n", lcore_id);
-		return;
-	}
-
-	while (!force_quit) {
-		if (lcore_id == rte_get_master_lcore()) {
-
+	if (lcore_id == rte_get_master_lcore()) {
+		uint64_t prev_tsc, cur_tsc;
+		prev_tsc = rte_rdtsc();
+		while (!force_quit) {
+			cur_tsc = rte_rdtsc();
+			if (unlikely((cur_tsc - prev_tsc) > timer_period)) {
+				prev_tsc = cur_tsc;
+				display_statistics();
+			}			
 		}
-		else {
+	}
+	else {
+		if (qconf->n_rx_port == 0 ) {
+			printf("lcore %u has nothing to do\n", lcore_id);
+			return;
+		}
+		while (!force_quit) {
 			for (i = 0; i < qconf->n_rx_port; i++) {
 				portid = qconf->rx_port_list[i];
-				nb_rx = rte_eth_rx_burst(portid, 0,
-					pkts_burst, MAX_PKT_BURST);
+				nb_rx = rte_eth_rx_burst(portid, 0, pkts_burst, MAX_PKT_BURST);
 				for (j = 0; j < nb_rx; j++) {
 					m = pkts_burst[j];
 					rte_prefetch0(rte_pktmbuf_mtod(m, void*));
-					do_work(m);
+					// do_work(m);
+					rte_rwlock_write_lock(&rwl[0]);
+					flow_infos[i].bytes += m->pkt_len;
+					rte_rwlock_write_unlock(&rwl[0]);
+					rte_pktmbuf_free(m);
 				}
 			}
+			fflush(stdout);
 		}
-	}
+	}	
+	return 0;
 }
 
+static int
+flow_info_init() {
+	int ret;
+	if (file_name == NULL) {
+		uint8_t ip[4] = { 10,10,40,200 };
+		strcpy(flow_infos[0].name, "flow 1");
+		flow_infos[0].nb_ip = 1;
+		flow_infos[0].ip[0] = ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3];
+		nb_flows = 1;
+		ret = 0;
+	}
+	else {
+		/* todo: read config file */
+		ret = -1;
+	}
+	
+	return ret;
+}
 
 int 
 main(int argc, char** argv) {
 
-	int ret;
+	int ret,i;
 	uint32_t portid;
-	int nb_lcores, rx_lcore_id = 1;
-	uint32_t nb_tx_queue=1, nb_rx_queue=1, lcore_id;
+	int nb_lcores, rx_lcore_id;
+	uint32_t nb_tx_queue = 0, nb_rx_queue = 1, lcore_id;
 	unsigned int nb_mbufs;
 	uint16_t nb_ports_available = 0, nb_ports;
-	struct lcore_queue_conf* qconf = NULL;
-
+	struct lcore_queue_conf* qconf;
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0) {
@@ -253,14 +352,21 @@ main(int argc, char** argv) {
 	if (ret < 0) {
 		rte_exit(EXIT_FAILURE, "Invalid monitor arguments\n");
 	}
+	ret = flow_info_init();
+	if (ret < 0) {
+		rte_exit(EXIT_FAILURE, "flow info init fails.\n");
+	}
+	for (i = 0; i < nb_flows; i++) {
+		rte_rwlock_init(&rwl[i]);
+	}
 	nb_lcores = rte_lcore_count();
 	nb_ports = rte_eth_dev_count_avail();
-	nb_mbufs = RTE_MAX(nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST +
-		nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
-	pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", nb_mbufs,
-		MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
-		rte_socket_id());
-
+	timer_period *= rte_get_timer_hz();
+	if (nb_ports == 0)
+		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
+	rx_lcore_id = 1;
+	qconf = NULL;
+	/* assign lcore for ports */
 	RTE_ETH_FOREACH_DEV(portid) {
 		/* skip ports that are not enabled */
 		if ((enabled_port_mask & (1 << portid)) == 0)
@@ -282,7 +388,13 @@ main(int argc, char** argv) {
 		qconf->n_rx_port++;
 		printf("Lcore %u: RX port %u\n", rx_lcore_id, portid);
 	}
+	nb_mbufs = RTE_MAX(nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST +
+		nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
+	pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", nb_mbufs,
+		MEMPOOL_CACHE_SIZE, RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE,
+		rte_socket_id());
 
+	/* init each port */
 	RTE_ETH_FOREACH_DEV(portid) {
 		struct rte_eth_conf local_port_conf = port_conf;
 		struct rte_eth_rxconf rxq_conf;
@@ -293,7 +405,7 @@ main(int argc, char** argv) {
 			printf("Skipping disabled port %d.\n", portid);
 			continue;
 		}
-
+		nb_ports_available++;
 		printf("Initializing port %d ... ", portid);
 		fflush(stdout);
 
@@ -327,18 +439,6 @@ main(int argc, char** argv) {
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n",
 				ret, portid);
 		}
-		
-		/* init one TX queue on each port*/
-		fflush(stdout);
-		txq_conf = dev_info.default_txconf;
-		txq_conf.offloads = local_port_conf.txmode.offloads;
-		ret = rte_eth_tx_queue_setup(portid, 0, nb_txd, 
-			rte_eth_dev_socket_id(portid), &txq_conf);
-		//ret = rte_eth_tx_queue_setup(portid, 1, nb_txd, 0, txconf);
-		if (ret < 0)
-			rte_exit(EXIT_FAILURE,
-				"rte_eth_tx_queue_setup: err=%d, "
-				"port=%d\n", ret, portid);
 	}
 	printf("Ports initialization completes.\n\n");
 
@@ -353,7 +453,7 @@ main(int argc, char** argv) {
 		printf("done: \n");
 
 		rte_eth_promiscuous_enable(portid);
-		nb_ports_available++;
+		
 	}
 
 	if (!nb_ports_available) {
