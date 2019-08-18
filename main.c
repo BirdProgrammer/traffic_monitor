@@ -38,6 +38,7 @@
 #include <rte_ether.h>
 #include <rte_byteorder.h>
 #include "rte_rwlock.h"
+#include "rte_cfgfile.h"
 
 
 static struct rte_eth_conf port_conf = {
@@ -79,6 +80,7 @@ static char* file_name = NULL;
 static unsigned int rx_queue_per_lcore = 1;
 static rte_rwlock_t rwl[MAX_FLOW_NUMBER];
 static uint64_t timer_period = 1; /* default period is 1 seconds */
+static uint64_t tsc_period;
 static void
 signal_handler(int signal_number) {
 	if (signal_number == SIGINT || signal_number == SIGTERM) {
@@ -124,6 +126,9 @@ parse_args(int argc, char** argv) {
 				fprintf(stderr, "Invalid portmask.\n");
 				return -1;
 			}
+			break;
+		case 't':
+			timer_period = atoi(optarg);
 			break;
 		case 1:
 			file_name = malloc(strlen(optarg));
@@ -219,29 +224,24 @@ static void
 do_work(struct rte_mbuf* m) {
 	struct ether_hdr* eth_hdr;
 	struct ipv4_hdr* ipv4_hdr;
-	uint16_t ether_type, offset;
+	uint16_t ether_type, offset=0;
 	int i, j;
 
 	eth_hdr = rte_pktmbuf_mtod(m,struct ether_hdr*);
 	ether_type = eth_hdr->ether_type;
-	if (ether_type == rte_cpu_to_be_16(ETHER_TYPE_VLAN))
-		printf("VLAN taged frame, offset:");
 	offset = get_vlan_offset(eth_hdr, &ether_type);
-	if (offset > 0)
-		printf("%d\n", offset);
+
 	if (ether_type == rte_cpu_to_be_16(ETHER_TYPE_ARP)) {
 		/* handle arp */
 	}else if (eth_hdr->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)) {
 		ipv4_hdr = (struct ipv4_hdr*)((char*)(eth_hdr + 1)+offset);
-		printf("ip = %d\n", ipv4_hdr->dst_addr);
 		for (i = 0; i < MAX_FLOW_NUMBER; i++) {
 			for (j = 0; j < flow_infos[i].nb_ip; j++) {
 				if (ipv4_hdr->dst_addr == flow_infos[i].ip[j]) {
 					rte_rwlock_write_lock(&rwl[i]);
 					flow_infos[i].bytes += m->data_len;
 					rte_rwlock_write_unlock(&rwl[i]);
-					printf("%ld\n", flow_infos[i].bytes);
-					break;
+					return;
 				}
 			}
 		}
@@ -252,13 +252,26 @@ do_work(struct rte_mbuf* m) {
 static void 
 display_statistics() {
 	int i;
+	unsigned long bit;
 	for (i = 0; i < nb_flows; i++) {
 		rte_rwlock_write_lock(&rwl[i]);
-		printf("flow_name:%s\trate:%ld\n", flow_infos[i].name, flow_infos[i].bytes);
+		bit = flow_infos[i].bytes * 8 / timer_period;
 		flow_infos[i].bytes = 0;
 		rte_rwlock_write_unlock(&rwl[i]);
+		if ( bit > 1000000) {
+			printf("flow_name:%s\trate:%.4fMbps,%ld bps \n", 
+				flow_infos[i].name, bit*1.0/1000000, bit);
+		}
+		else if (bit > 1000) {
+			printf("flow_name:%s\trate:%.4fKbps,%ld bps \n",
+				flow_infos[i].name, bit * 1.0 / 1000, bit);
+		}
+		else {
+			printf("flow_name:%s\trate:%ld bps \n", flow_infos[i].name, bit);
+		}
 	}
 	printf("\n\n");
+	fflush(stdout);
 }
 static int 
 main_loop(__attribute__((unused)) void* dummy) {
@@ -276,7 +289,7 @@ main_loop(__attribute__((unused)) void* dummy) {
 		prev_tsc = rte_rdtsc();
 		while (!force_quit) {
 			cur_tsc = rte_rdtsc();
-			if (unlikely((cur_tsc - prev_tsc) > timer_period)) {
+			if (unlikely((cur_tsc - prev_tsc) > tsc_period)) {
 				prev_tsc = cur_tsc;
 				display_statistics();
 			}			
@@ -294,14 +307,10 @@ main_loop(__attribute__((unused)) void* dummy) {
 				for (j = 0; j < nb_rx; j++) {
 					m = pkts_burst[j];
 					rte_prefetch0(rte_pktmbuf_mtod(m, void*));
-					// do_work(m);
-					rte_rwlock_write_lock(&rwl[0]);
-					flow_infos[i].bytes += m->pkt_len;
-					rte_rwlock_write_unlock(&rwl[0]);
+					do_work(m);
 					rte_pktmbuf_free(m);
 				}
 			}
-			fflush(stdout);
 		}
 	}	
 	return 0;
@@ -310,19 +319,64 @@ main_loop(__attribute__((unused)) void* dummy) {
 static int
 flow_info_init() {
 	int ret;
+	printf("Configuring flow infos......\n");
 	if (file_name == NULL) {
-		uint8_t ip[4] = { 10,10,40,200 };
+		uint8_t ip[4] = { 192,168,1,111 };
 		strcpy(flow_infos[0].name, "flow 1");
 		flow_infos[0].nb_ip = 1;
-		flow_infos[0].ip[0] = ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3];
+		flow_infos[0].ip[0] = ip[3] << 24 | ip[2] << 16 | ip[1] << 8 | ip[0];
 		nb_flows = 1;
 		ret = 0;
 	}
 	else {
 		/* todo: read config file */
-		ret = -1;
+		struct rte_cfgfile* file = rte_cfgfile_load(file_name, 0);
+		char entry_name[40];
+		char section_name[40];
+		int i,j;
+		uint8_t ip[4];
+		const char* entry;
+		if (file == NULL) {
+			printf("rte_cfgfile_load failed of %s", file_name);
+			return -1;
+		}
+		entry = rte_cfgfile_get_entry(file, "globalinfo", "number of flows");
+		if (unlikely(!entry)) {
+			printf("rte_cfgfile_load failed at globalinfo : number of flows\n" );
+			return -1;
+		}
+		nb_flows = atoi(entry);
+		for (i = 0; i < nb_flows; i++) {
+			sprintf(section_name, "flow%u", i);
+			entry = rte_cfgfile_get_entry(file, section_name, "name");
+			if (unlikely(!entry)) {
+				printf("rte_cfgfile_load failed at %s: name\n", section_name);
+				return -1;
+			}
+			strcpy(flow_infos[i].name, entry);
+			entry = rte_cfgfile_get_entry(file, section_name, "number of ips");
+			if (unlikely(!entry)) {
+				printf("rte_cfgfile_load failed at %s: %s\n", section_name, entry_name);
+				return -1;
+			}
+			
+			flow_infos[i].nb_ip = atoi(entry);
+			for (j = 0; j < flow_infos[i].nb_ip; j++) {
+				sprintf(entry_name, "ip%u", j);
+				entry = rte_cfgfile_get_entry(file, section_name, entry_name);
+				if (unlikely(!entry)) {
+					printf("rte_cfgfile_load failed at %s: %s\n", section_name, entry_name);
+					return -1;
+				}
+				sscanf(entry, "%u.%u.%u.%u",&ip[0],&ip[1],&ip[2],&ip[3]);
+				flow_infos[i].ip[j] = ip[3] << 24 | ip[2] << 16 | ip[1] << 8 | ip[0];
+			}
+			rte_cfgfile_close(file);
+			free(file_name);
+		}
+		ret = 0;
 	}
-	
+	printf("Configuring flow infos done.\n");
 	return ret;
 }
 
@@ -361,11 +415,12 @@ main(int argc, char** argv) {
 	}
 	nb_lcores = rte_lcore_count();
 	nb_ports = rte_eth_dev_count_avail();
-	timer_period *= rte_get_timer_hz();
+	tsc_period = timer_period * rte_get_timer_hz();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
 	rx_lcore_id = 1;
 	qconf = NULL;
+
 	/* assign lcore for ports */
 	RTE_ETH_FOREACH_DEV(portid) {
 		/* skip ports that are not enabled */
@@ -391,7 +446,7 @@ main(int argc, char** argv) {
 	nb_mbufs = RTE_MAX(nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST +
 		nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
 	pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", nb_mbufs,
-		MEMPOOL_CACHE_SIZE, RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE,
+		MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
 		rte_socket_id());
 
 	/* init each port */
@@ -401,7 +456,7 @@ main(int argc, char** argv) {
 		struct rte_eth_txconf txq_conf;
 		struct rte_eth_dev_info dev_info;
 
-		if (enabled_port_mask & (1 << portid) == 0) {
+		if (enabled_port_mask & (1 << portid) == 0) { 
 			printf("Skipping disabled port %d.\n", portid);
 			continue;
 		}
@@ -450,7 +505,6 @@ main(int argc, char** argv) {
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n",
 				ret, portid);
-		printf("done: \n");
 
 		rte_eth_promiscuous_enable(portid);
 		
