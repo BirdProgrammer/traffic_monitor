@@ -13,6 +13,7 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
+#include<time.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
@@ -250,25 +251,28 @@ do_work(struct rte_mbuf* m) {
 
 /* display the rates of all flows */
 static void 
-display_statistics() {
+display_statistics(FILE* fp) {
 	int i;
 	unsigned long bit;
+	char string[MAX_NAME_LENGTH];
 	for (i = 0; i < nb_flows; i++) {
 		rte_rwlock_write_lock(&rwl[i]);
 		bit = flow_infos[i].bytes * 8 / timer_period;
 		flow_infos[i].bytes = 0;
 		rte_rwlock_write_unlock(&rwl[i]);
 		if ( bit > 1000000) {
-			printf("flow_name:%s\trate:%.4fMbps,%ld bps \n", 
+			printf("flow_name:%s\trate:%.4fMbps,\t%ld bps \n", 
 				flow_infos[i].name, bit*1.0/1000000, bit);
 		}
 		else if (bit > 1000) {
-			printf("flow_name:%s\trate:%.4fKbps,%ld bps \n",
+			printf("flow_name:%s\trate:%.4fKbps,\t%ld bps \n",
 				flow_infos[i].name, bit * 1.0 / 1000, bit);
 		}
 		else {
 			printf("flow_name:%s\trate:%ld bps \n", flow_infos[i].name, bit);
 		}
+		sprintf(string, "%s,%d\n", flow_infos[i].name, bit);
+		fputs(string, fp);
 	}
 	printf("\n\n");
 	fflush(stdout);
@@ -285,15 +289,30 @@ main_loop(__attribute__((unused)) void* dummy) {
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_queue_conf[lcore_id];
 	if (lcore_id == rte_get_master_lcore()) {
+		FILE* fp;
+		time_t timep;
+		struct tm* p;
+		time(&timep);
+		p = gmtime(&timep);
+		char fileName[MAX_NAME_LENGTH];
+		sprintf(fileName, "%d_%d_%d_%d_%d_%d.csv", 1900 + p->tm_year, 1 + p->tm_mon, 
+			p->tm_mday, 8 + p->tm_hour, p->tm_min, p->tm_sec);
+
+		fp = fopen(fileName, "w");
+		if (fp == NULL) {
+			printf("creating file fails,exiting...\n");
+			force_quit = true;
+		}
 		uint64_t prev_tsc, cur_tsc;
 		prev_tsc = rte_rdtsc();
 		while (!force_quit) {
 			cur_tsc = rte_rdtsc();
 			if (unlikely((cur_tsc - prev_tsc) > tsc_period)) {
 				prev_tsc = cur_tsc;
-				display_statistics();
+				display_statistics(fp);
 			}			
 		}
+		fclose(fp);
 	}
 	else {
 		if (qconf->n_rx_port == 0 ) {
